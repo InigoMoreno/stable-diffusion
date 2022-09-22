@@ -9,11 +9,15 @@ import sys
 import copy
 import warnings
 import time
+from tqdm import tqdm
 import ldm.dream.readline
 from ldm.dream.pngwriter import PngWriter, PromptFormatter
 from ldm.dream.server import DreamServer, ThreadingDreamServer
 from ldm.dream.image_util import make_grid
 from omegaconf import OmegaConf
+from wand.image import Image
+from wand.api import library
+from subs_utils import process_subs
 
 # Placeholder to be replaced with proper class that tracks the
 # outputs and associates with the prompt that generated them.
@@ -184,148 +188,198 @@ def main_loop(t2i, outdir, prompt_as_dir, parser, infile):
         if len(opt.prompt) == 0:
             print('Try again with a prompt!')
             continue
-        # retrieve previous value!
-        if opt.init_img is not None and re.match('^-\\d+$', opt.init_img):
-            try:
-                opt.init_img = last_results[int(opt.init_img)][0]
-                print(f'>> Reusing previous image {opt.init_img}')
-            except IndexError:
-                print(
-                    f'>> No previous initial image at position {opt.init_img} found')
-                opt.init_img = None
-                continue
-
-        if opt.seed is not None and opt.seed < 0:   # retrieve previous value!
-            try:
-                opt.seed = last_results[opt.seed][1]
-                print(f'>> Reusing previous seed {opt.seed}')
-            except IndexError:
-                print(f'>> No previous seed at position {opt.seed} found')
-                opt.seed = None
-                continue
-
-        do_grid = opt.grid or t2i.grid
-
-        if opt.with_variations is not None:
-            # shotgun parsing, woo
-            parts = []
-            broken = False  # python doesn't have labeled loops...
-            for part in opt.with_variations.split(','):
-                seed_and_weight = part.split(':')
-                if len(seed_and_weight) != 2:
-                    print(f'could not parse with_variation part "{part}"')
-                    broken = True
-                    break
+        file_writer = PngWriter(outdir)
+        iterator = None
+        if opt.style is not None:
+            opt.prompt += ", " + opt.style
+        if opt.gif > 0:
+            iterator = range(opt.gif)
+        if opt.subtitle is not None:
+            iterator = process_subs(opt.subtitle, rate=opt.gif_delay, start=opt.subtitle_start)
+        if iterator is not None:
+            if opt.gif_tint_strength.isnumeric():
+                opt.gif_tint_strength = f"gray({opt.gif_tint_strength})"
+            with Image() as gif:
                 try:
-                    seed = int(seed_and_weight[0])
-                    weight = float(seed_and_weight[1])
-                except ValueError:
-                    print(f'could not parse with_variation part "{part}"')
-                    broken = True
-                    break
-                parts.append([seed, weight])
-            if broken:
-                continue
-            if len(parts) > 0:
-                opt.with_variations = parts
-            else:
-                opt.with_variations = None
-
-        if opt.outdir:
-            if not os.path.exists(opt.outdir):
-                os.makedirs(opt.outdir)
-            current_outdir = opt.outdir
-        elif prompt_as_dir:
-            # sanitize the prompt to a valid folder name
-            subdir = path_filter.sub('_', opt.prompt)[:name_max].rstrip(' .')
-
-            # truncate path to maximum allowed length
-            # 27 is the length of '######.##########.##.png', plus two separators and a NUL
-            subdir = subdir[:(path_max - 27 - len(os.path.abspath(outdir)))]
-            current_outdir = os.path.join(outdir, subdir)
-
-            print('Writing files to directory: "' + current_outdir + '"')
-
-            # make sure the output directory exists
-            if not os.path.exists(current_outdir):
-                os.makedirs(current_outdir)
+                    for element in tqdm(iterator):
+                        if isinstance(element, str) and len(element) > 0:
+                            opt.prompt = element
+                            if opt.style is not None:
+                                opt.prompt += ", " + opt.style
+                        print(f"{opt.prompt=}")
+                        image_path = process_image(t2i, outdir, prompt_as_dir, parser, infile, opt)[0][0]
+                        with Image(filename=image_path) as image:
+                            if opt.gif_crop is not None:
+                                image.transform(crop=opt.gif_crop)
+                                image.liquid_rescale(opt.width or 512, opt.height or 512)
+                            if opt.gif_tint is not None:
+                                image.colorize(color=opt.gif_tint, alpha=opt.gif_tint_strength)
+                            if opt.gif_swirl is not None:
+                                image.swirl(degree=opt.gif_swirl)
+                            if opt.gif_implode is not None:
+                                image.implode(amount=opt.gif_implode)
+                            image.save(filename=f"/tmp/gif.png")
+                        if opt.save_gif:
+                            with Image(filename=image_path) as image:
+                                image.delay = opt.gif_delay
+                                gif.sequence.append(image)
+                        opt.init_img = "/tmp/gif.png"
+                        opt.fit = True
+                except BaseException as e:
+                    print(e)
+                    pass
+                finally:
+                    if opt.save_gif:
+                        gif.type = 'optimize'
+                        gif.save(filename=os.path.join(outdir, f"{file_writer.unique_prefix()}.gif"))
         else:
-            current_outdir = outdir
-
-        # Here is where the images are actually generated!
-        last_results = []
-        try:
-            file_writer = PngWriter(current_outdir)
-            prefix = file_writer.unique_prefix()
-            results = []  # list of filename, prompt pairs
-            grid_images = dict()  # seed -> Image, only used if `do_grid`
-
-            def image_writer(image, seed, upscaled=False):
-                path = None
-                if do_grid:
-                    grid_images[seed] = image
-                else:
-                    if upscaled and opt.save_original:
-                        filename = f'{prefix}.{seed}.postprocessed.png'
-                    else:
-                        filename = f'{prefix}.{seed}.png'
-                    if opt.variation_amount > 0:
-                        iter_opt = argparse.Namespace(**vars(opt))  # copy
-                        this_variation = [[seed, opt.variation_amount]]
-                        if opt.with_variations is None:
-                            iter_opt.with_variations = this_variation
-                        else:
-                            iter_opt.with_variations = opt.with_variations + this_variation
-                        iter_opt.variation_amount = 0
-                        normalized_prompt = PromptFormatter(
-                            t2i, iter_opt).normalize_prompt()
-                        metadata_prompt = f'{normalized_prompt} -S{iter_opt.seed}'
-                    elif opt.with_variations is not None:
-                        normalized_prompt = PromptFormatter(
-                            t2i, opt).normalize_prompt()
-                        # use the original seed - the per-iteration value is the last variation-seed
-                        metadata_prompt = f'{normalized_prompt} -S{opt.seed}'
-                    else:
-                        normalized_prompt = PromptFormatter(
-                            t2i, opt).normalize_prompt()
-                        metadata_prompt = f'{normalized_prompt} -S{seed}'
-                    path = file_writer.save_image_and_prompt_to_png(
-                        image, metadata_prompt, filename)
-                    if (not upscaled) or opt.save_original:
-                        # only append to results if we didn't overwrite an earlier output
-                        results.append([path, metadata_prompt])
-                last_results.append([path, seed])
-
-            t2i.prompt2image(image_callback=image_writer, **vars(opt))
-
-            if do_grid and len(grid_images) > 0:
-                grid_img   = make_grid(list(grid_images.values()))
-                grid_seeds = list(grid_images.keys())
-                first_seed = last_results[0][1]
-                filename = f'{prefix}.{first_seed}.png'
-                # TODO better metadata for grid images
-                normalized_prompt = PromptFormatter(
-                    t2i, opt).normalize_prompt()
-                metadata_prompt = f'{normalized_prompt} -S{first_seed} --grid -n{len(grid_images)} # {grid_seeds}'
-                path = file_writer.save_image_and_prompt_to_png(
-                    grid_img, metadata_prompt, filename
-                )
-                results = [[path, metadata_prompt]]
-
-        except AssertionError as e:
-            print(e)
-            continue
-
-        except OSError as e:
-            print(e)
-            continue
-
-        print('Outputs:')
-        log_path = os.path.join(current_outdir, 'dream_log.txt')
-        write_log_message(results, log_path)
-        print()
+            process_image(t2i, outdir, prompt_as_dir, parser, infile, opt)
 
     print('goodbye!')
+
+
+def process_image(t2i, outdir, prompt_as_dir, parser, infile, opt):
+    # retrieve previous value!
+    if opt.init_img is not None and re.match('^-\\d+$', opt.init_img):
+        try:
+            opt.init_img = last_results[int(opt.init_img)][0]
+            print(f'>> Reusing previous image {opt.init_img}')
+        except IndexError:
+            print(
+                f'>> No previous initial image at position {opt.init_img} found')
+            opt.init_img = None
+            return
+
+    if opt.seed is not None and opt.seed < 0:   # retrieve previous value!
+        try:
+            opt.seed = last_results[opt.seed][1]
+            print(f'>> Reusing previous seed {opt.seed}')
+        except IndexError:
+            print(f'>> No previous seed at position {opt.seed} found')
+            opt.seed = None
+            return
+
+    do_grid = opt.grid or t2i.grid
+
+    if opt.with_variations is not None:
+        # shotgun parsing, woo
+        parts = []
+        broken = False  # python doesn't have labeled loops...
+        for part in opt.with_variations.split(','):
+            seed_and_weight = part.split(':')
+            if len(seed_and_weight) != 2:
+                print(f'could not parse with_variation part "{part}"')
+                broken = True
+                break
+            try:
+                seed = int(seed_and_weight[0])
+                weight = float(seed_and_weight[1])
+            except ValueError:
+                print(f'could not parse with_variation part "{part}"')
+                broken = True
+                break
+            parts.append([seed, weight])
+        if broken:
+            return
+        if len(parts) > 0:
+            opt.with_variations = parts
+        else:
+            opt.with_variations = None
+
+    if opt.outdir:
+        if not os.path.exists(opt.outdir):
+            os.makedirs(opt.outdir)
+        current_outdir = opt.outdir
+    elif prompt_as_dir:
+        # sanitize the prompt to a valid folder name
+        subdir = path_filter.sub('_', opt.prompt)[:name_max].rstrip(' .')
+
+        # truncate path to maximum allowed length
+        # 27 is the length of '######.##########.##.png', plus two separators and a NUL
+        subdir = subdir[:(path_max - 27 - len(os.path.abspath(outdir)))]
+        current_outdir = os.path.join(outdir, subdir)
+
+        print('Writing files to directory: "' + current_outdir + '"')
+
+        # make sure the output directory exists
+        if not os.path.exists(current_outdir):
+            os.makedirs(current_outdir)
+    else:
+        current_outdir = outdir
+
+    # Here is where the images are actually generated!
+    last_results = []
+    try:
+        file_writer = PngWriter(current_outdir)
+        prefix = file_writer.unique_prefix()
+        results = []  # list of filename, prompt pairs
+        grid_images = dict()  # seed -> Image, only used if `do_grid`
+
+        def image_writer(image, seed, upscaled=False):
+            path = None
+            if do_grid:
+                grid_images[seed] = image
+            else:
+                if upscaled and opt.save_original:
+                    filename = f'{prefix}.{seed}.postprocessed.png'
+                else:
+                    filename = f'{prefix}.{seed}.png'
+                if opt.variation_amount > 0:
+                    iter_opt = argparse.Namespace(**vars(opt))  # copy
+                    this_variation = [[seed, opt.variation_amount]]
+                    if opt.with_variations is None:
+                        iter_opt.with_variations = this_variation
+                    else:
+                        iter_opt.with_variations = opt.with_variations + this_variation
+                    iter_opt.variation_amount = 0
+                    normalized_prompt = PromptFormatter(
+                        t2i, iter_opt).normalize_prompt()
+                    metadata_prompt = f'{normalized_prompt} -S{iter_opt.seed}'
+                elif opt.with_variations is not None:
+                    normalized_prompt = PromptFormatter(
+                        t2i, opt).normalize_prompt()
+                    # use the original seed - the per-iteration value is the last variation-seed
+                    metadata_prompt = f'{normalized_prompt} -S{opt.seed}'
+                else:
+                    normalized_prompt = PromptFormatter(
+                        t2i, opt).normalize_prompt()
+                    metadata_prompt = f'{normalized_prompt} -S{seed}'
+                path = file_writer.save_image_and_prompt_to_png(
+                    image, metadata_prompt, filename)
+                if (not upscaled) or opt.save_original:
+                    # only append to results if we didn't overwrite an earlier output
+                    results.append([path, metadata_prompt])
+            last_results.append([path, seed])
+
+        t2i.prompt2image(image_callback=image_writer, **vars(opt))
+
+        if do_grid and len(grid_images) > 0:
+            grid_img = make_grid(list(grid_images.values()))
+            grid_seeds = list(grid_images.keys())
+            first_seed = last_results[0][1]
+            filename = f'{prefix}.{first_seed}.png'
+            # TODO better metadata for grid images
+            normalized_prompt = PromptFormatter(
+                t2i, opt).normalize_prompt()
+            metadata_prompt = f'{normalized_prompt} -S{first_seed} --grid -n{len(grid_images)} # {grid_seeds}'
+            path = file_writer.save_image_and_prompt_to_png(
+                grid_img, metadata_prompt, filename
+            )
+            results = [[path, metadata_prompt]]
+
+    except AssertionError as e:
+        print(e)
+        return
+
+    except OSError as e:
+        print(e)
+        return
+
+    print('Outputs:')
+    log_path = os.path.join(current_outdir, 'dream_log.txt')
+    write_log_message(results, log_path)
+    print()
+    return results
 
 
 def get_next_command(infile=None) -> str:  # command string
@@ -374,8 +428,7 @@ def write_log_message(results, log_path):
     log_lines = [f'{path}: {prompt}\n' for path, prompt in results]
     for l in log_lines:
         output_cntr += 1
-        print(f'[{output_cntr}] {l}',end='')
-
+        print(f'[{output_cntr}] {l}', end='')
 
     with open(log_path, 'a', encoding='utf-8') as file:
         file.writelines(log_lines)
@@ -396,7 +449,7 @@ SAMPLER_CHOICES = [
 def create_argv_parser():
     parser = argparse.ArgumentParser(
         description="""Generate images using Stable Diffusion.
-        Use --web to launch the web interface. 
+        Use --web to launch the web interface.
         Use --from_file to load prompts from a file path or standard input ("-").
         Otherwise you will be dropped into an interactive command prompt (type -h for help.)
         Other command-line arguments are defaults that can usually be overridden
@@ -677,6 +730,72 @@ def create_cmd_parser():
         default=None,
         type=str,
         help='list of variations to apply, in the format `seed:weight,seed:weight,...'
+    )
+
+    parser.add_argument(
+        '--gif',
+        default=0,
+        type=int,
+        help='generate a gif of N frames'
+    )
+    parser.add_argument(
+        '--gif_delay',
+        default=20,
+        type=int,
+        help='delay between each frame (hundreths of second)'
+    )
+    parser.add_argument(
+        '--gif_crop',
+        type=str,
+        default=None,
+        help='imagemagick crop string (example: 480x480+16+16)'
+    )
+    parser.add_argument(
+        '--subtitle',
+        type=str,
+        default=None,
+        help='path to subtitle file to use for prompts'
+    )
+    parser.add_argument(
+        '--subtitle_start',
+        type=float,
+        default=0.0,
+        help='which second to start the subtitles'
+    )
+    parser.add_argument(
+        '--save_gif',
+        action='store_true',
+        help='whether to save the gif'
+    )
+    parser.add_argument(
+        '--style',
+        type=str,
+        default=None,
+        help='style to be appended to the prompt'
+    )
+    parser.add_argument(
+        '--gif_tint',
+        type=str,
+        default=None,
+        help='colour to tint'
+    )
+    parser.add_argument(
+        '--gif_tint_strength',
+        type=str,
+        default="30",
+        help='strength to tint'
+    )
+    parser.add_argument(
+        '--gif_swirl',
+        type=float,
+        default=0.0,
+        help='swirl degrees'
+    )
+    parser.add_argument(
+        '--gif_implode',
+        type=float,
+        default=0.0,
+        help='implode ammount'
     )
     return parser
 
